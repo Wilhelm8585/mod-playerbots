@@ -5274,6 +5274,29 @@ std::string const PlayerbotAI::HandleRemoteCommand(std::string const command)
     {
         return currentEngine->ListStrategies();
     }
+    else if (command == "role")
+    {
+        std::ostringstream out;
+        bool hasRole = false;
+
+        auto appendRole = [&out, &hasRole](char const* role)
+        {
+            if (hasRole)
+                out << ",";
+
+            out << role;
+            hasRole = true;
+        };
+
+        if (IsTank(bot))
+            appendRole("tank");
+        if (IsHeal(bot))
+            appendRole("healer");
+        if (IsDps(bot))
+            appendRole("dps");
+
+        return hasRole ? out.str() : "unknown";
+    }
     else if (command == "action")
     {
         return currentEngine->GetLastAction();
