@@ -35,14 +35,17 @@ std::string HandleControlRequest(std::string const& request)
     uint64 rawGuid = 0;
     std::string extra;
 
-    if (!(input >> control >> action >> rawGuid) || (input >> extra) || control != "control" || action != "follow" ||
+    bool const validRequest = static_cast<bool>(input >> control >> action >> rawGuid);
+    bool const validAction = action == "follow" || action == "stay" || action == "attack";
+    if (!validRequest || (input >> extra) || control != "control" || !validAction ||
         rawGuid == 0 || rawGuid > std::numeric_limits<ObjectGuid::LowType>::max())
     {
-        return R"({"status":"error","error":"invalid_request","expected":"control follow <botGuid>"})";
+        return R"({"status":"error","error":"invalid_request","expected":"control <follow|stay|attack> <botGuid>"})";
     }
 
     uint64 const requestId = nextRemoteControlRequestId.fetch_add(1, std::memory_order_relaxed);
-    auto operation = std::make_unique<RemoteFollowOperation>(static_cast<ObjectGuid::LowType>(rawGuid), requestId);
+    auto operation = std::make_unique<RemoteControlOperation>(
+        static_cast<ObjectGuid::LowType>(rawGuid), requestId, action);
 
     if (!PlayerbotWorldThreadProcessor::instance().QueueOperation(std::move(operation)))
     {
@@ -52,7 +55,7 @@ std::string HandleControlRequest(std::string const& request)
     }
 
     std::ostringstream response;
-    response << R"({"status":"accepted","command":"follow","requestId":)" << requestId
+    response << R"({"status":"accepted","command":")" << action << R"(","requestId":)" << requestId
              << R"(,"botGuid":)" << rawGuid << "}";
     return response.str();
 }
