@@ -10,13 +10,53 @@
 #include <boost/bind.hpp>
 #include <boost/smart_ptr.hpp>
 #include <boost/thread/thread.hpp>
+#include <atomic>
 #include <cstdlib>
+#include <limits>
+#include <sstream>
 #include "RandomPlayerbotMgr.h"
 
 #include "IoContext.h"
+#include "PlayerbotOperations.h"
+#include "PlayerbotWorldThreadProcessor.h"
 
 using boost::asio::ip::tcp;
 typedef boost::shared_ptr<tcp::socket> socket_ptr;
+
+namespace
+{
+std::atomic<uint64> nextRemoteControlRequestId{1};
+
+std::string HandleControlRequest(std::string const& request)
+{
+    std::istringstream input(request);
+    std::string control;
+    std::string action;
+    uint64 rawGuid = 0;
+    std::string extra;
+
+    if (!(input >> control >> action >> rawGuid) || (input >> extra) || control != "control" || action != "follow" ||
+        rawGuid == 0 || rawGuid > std::numeric_limits<ObjectGuid::LowType>::max())
+    {
+        return R"({"status":"error","error":"invalid_request","expected":"control follow <botGuid>"})";
+    }
+
+    uint64 const requestId = nextRemoteControlRequestId.fetch_add(1, std::memory_order_relaxed);
+    auto operation = std::make_unique<RemoteFollowOperation>(static_cast<ObjectGuid::LowType>(rawGuid), requestId);
+
+    if (!PlayerbotWorldThreadProcessor::instance().QueueOperation(std::move(operation)))
+    {
+        std::ostringstream response;
+        response << R"({"status":"error","error":"queue_full","requestId":)" << requestId << "}";
+        return response.str();
+    }
+
+    std::ostringstream response;
+    response << R"({"status":"accepted","command":"follow","requestId":)" << requestId
+             << R"(,"botGuid":)" << rawGuid << "}";
+    return response.str();
+}
+}
 
 bool ReadLine(socket_ptr sock, std::string* buffer, std::string* line)
 {
@@ -48,7 +88,10 @@ void session(socket_ptr sock)
         std::string buffer, request;
         while (ReadLine(sock, &buffer, &request))
         {
-            std::string const response = RandomPlayerbotMgr::instance().HandleRemoteCommand(request) + "\n";
+            std::string const response =
+                (request.rfind("control", 0) == 0 ? HandleControlRequest(request)
+                                                   : RandomPlayerbotMgr::instance().HandleRemoteCommand(request)) +
+                "\n";
             boost::asio::write(*sock, boost::asio::buffer(response.c_str(), response.size()));
             request = "";
         }

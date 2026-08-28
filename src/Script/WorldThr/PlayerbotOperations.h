@@ -523,4 +523,54 @@ private:
     uint32 m_masterAccountId = 0;
 };
 
+// Execute the existing player-facing Follow shortcut from the world thread.
+class RemoteFollowOperation : public PlayerbotOperation
+{
+public:
+    RemoteFollowOperation(ObjectGuid::LowType botGuid, uint64 requestId)
+        : m_botGuid(botGuid), m_requestId(requestId)
+    {
+    }
+
+    bool Execute() override
+    {
+        ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(m_botGuid);
+        Player* bot = ObjectAccessor::FindConnectedPlayer(guid);
+        if (!bot || !bot->GetSession() || !bot->IsInWorld() || bot->IsDuringRemoveFromWorld())
+        {
+            LOG_DEBUG("playerbots", "Remote follow request {} failed: bot {} is not online", m_requestId, m_botGuid);
+            return false;
+        }
+
+        PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
+        if (!botAI)
+        {
+            LOG_DEBUG("playerbots", "Remote follow request {} failed: bot {} has no PlayerbotAI", m_requestId,
+                      m_botGuid);
+            return false;
+        }
+
+        Player* master = botAI->GetMaster();
+        if (!master || !master->GetSession() || !master->IsInWorld() || master->IsDuringRemoveFromWorld())
+        {
+            LOG_DEBUG("playerbots", "Remote follow request {} failed: bot {} has no valid master", m_requestId,
+                      m_botGuid);
+            return false;
+        }
+
+        bool const followed = botAI->DoSpecificAction("follow chat shortcut");
+        LOG_DEBUG("playerbots", "Remote follow request {} for bot {} {}", m_requestId, m_botGuid,
+                  followed ? "executed" : "failed");
+        return followed;
+    }
+
+    ObjectGuid GetBotGuid() const override { return ObjectGuid::Create<HighGuid::Player>(m_botGuid); }
+    uint32 GetPriority() const override { return 50; }
+    std::string GetName() const override { return "RemoteFollow"; }
+
+private:
+    ObjectGuid::LowType m_botGuid;
+    uint64 m_requestId;
+};
+
 #endif
