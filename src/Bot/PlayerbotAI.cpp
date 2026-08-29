@@ -5270,6 +5270,10 @@ std::string const PlayerbotAI::HandleRemoteCommand(std::string const command)
         out << " / " << pct << "%";
         return out.str();
     }
+    else if (command == "ilvl")
+    {
+        return std::to_string(GetEquipGearScore(bot));
+    }
     else if (command == "strategy")
     {
         return currentEngine->ListStrategies();
