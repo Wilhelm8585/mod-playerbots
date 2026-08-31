@@ -177,6 +177,10 @@ protected:
     void OnBotLoginInternal(Player* const bot) override;
 
 private:
+    bool IsPopulationBot(Player* bot);
+    bool IsPopulationInitialized(Player* bot);
+    void MarkPopulationInitialized(Player* bot);
+
     RandomPlayerbotMgr() : PlayerbotHolder(), processTicks(0)
     {
         this->playersLevel = sPlayerbotAIConfig.randombotStartingLevel;

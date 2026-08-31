@@ -9,6 +9,7 @@
 #include <WorldSessionMgr.h>
 
 #include <algorithm>
+#include <array>
 #include <boost/thread/thread.hpp>
 #include <cstdlib>
 #include <ctime>
@@ -19,6 +20,7 @@
 #include "Battleground.h"
 #include "BattlegroundMgr.h"
 #include "ChannelMgr.h"
+#include "CharacterCache.h"
 #include "DBCStores.h"
 #include "DBCStructure.h"
 #include "DatabaseEnv.h"
@@ -692,6 +694,7 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
             uint32 guid;
             uint8 rClass;
             uint8 rRace;
+            uint8 level;
             uint32 accountId;
         };
         std::vector<CharacterInfo> allCharacters;
@@ -712,6 +715,8 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
                 info.guid = fields[0].Get<uint32>();
                 info.rClass = fields[1].Get<uint8>();
                 info.rRace = fields[2].Get<uint8>();
+                info.level = sCharacterCache->GetCharacterLevelByGuid(
+                    ObjectGuid::Create<HighGuid::Player>(info.guid));
                 info.accountId = accountId;
                 allCharacters.push_back(info);
             } while (result->NextRow());
@@ -732,6 +737,77 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
             else
                 hordeChars.push_back(charInfo);
         }
+
+        struct LevelBand
+        {
+            uint8 minLevel;
+            uint8 maxLevel;
+        };
+
+        // LFG dungeon levels are static for the lifetime of the server. Keep one unique set of the same effective
+        // intervals used by LfgJoinAction instead of rebuilding it every time the population is topped up.
+        static std::vector<LevelBand> const levelBands = []
+        {
+            std::vector<LevelBand> bands;
+            uint32 expansion = sWorld->getIntConfig(CONFIG_EXPANSION);
+
+            for (uint32 id = 0; id < sLFGDungeonStore.GetNumRows(); ++id)
+            {
+                LFGDungeonEntry const* dungeon = sLFGDungeonStore.LookupEntry(id);
+                if (!dungeon || dungeon->TypeID != lfg::LFG_TYPE_DUNGEON || !dungeon->MinLevel ||
+                    dungeon->MaxLevel < dungeon->MinLevel || dungeon->ExpansionLevel > expansion)
+                {
+                    continue;
+                }
+
+                LevelBand band = {static_cast<uint8>(dungeon->MinLevel),
+                                  static_cast<uint8>(std::min(dungeon->MaxLevel, dungeon->MinLevel + 10))};
+                auto duplicate = std::find_if(bands.begin(), bands.end(), [&band](LevelBand const& current)
+                {
+                    return current.minLevel == band.minLevel && current.maxLevel == band.maxLevel;
+                });
+                if (duplicate == bands.end())
+                    bands.push_back(band);
+            }
+
+            std::sort(bands.begin(), bands.end(), [](LevelBand const& left, LevelBand const& right)
+            {
+                return left.minLevel == right.minLevel ? left.maxLevel < right.maxLevel : left.minLevel < right.minLevel;
+            });
+            return bands;
+        }();
+
+        std::array<std::vector<uint32>, 2> bandCoverage;
+        for (std::vector<uint32>& coverage : bandCoverage)
+            coverage.resize(levelBands.size());
+
+        auto addLevelCoverage = [&](TeamId team, uint8 level)
+        {
+            for (size_t band = 0; band < levelBands.size(); ++band)
+            {
+                if (level >= levelBands[band].minLevel && level <= levelBands[band].maxLevel)
+                    bandCoverage[team][band]++;
+            }
+        };
+
+        for (uint32 guid : currentBots)
+        {
+            ObjectGuid playerGuid = ObjectGuid::Create<HighGuid::Player>(guid);
+            CharacterCacheEntry const* character = sCharacterCache->GetCharacterCacheByGuid(playerGuid);
+            if (!character)
+                continue;
+
+            addLevelCoverage(IsAlliance(character->Race) ? TEAM_ALLIANCE : TEAM_HORDE, character->Level);
+        }
+
+        auto uncoveredBandCount = [&](TeamId team)
+        {
+            return std::count(bandCoverage[team].begin(), bandCoverage[team].end(), 0u);
+        };
+
+        LOG_DEBUG("playerbots", "Level population selection: {} candidates, {} LFG bands, uncovered A/H: {}/{}",
+                  allCharacters.size(), levelBands.size(), uncoveredBandCount(TEAM_ALLIANCE),
+                  uncoveredBandCount(TEAM_HORDE));
 
         // Lambda to handle bot login logic
         auto tryLoginBot = [&](const CharacterInfo& charInfo) -> bool
@@ -757,38 +833,72 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
             return true;
         };
 
-        // PHASE 1: Log-in Alliance bots up to allowedAllianceCount
-        for (auto const& charInfo : allianceChars)
+        auto isAvailable = [&](CharacterInfo const& charInfo)
         {
-            if (!allowedAllianceCount)
-                break;
+            return !GetEventValue(charInfo.guid, "add") && !GetEventValue(charInfo.guid, "logout") &&
+                   !GetPlayerBot(charInfo.guid) &&
+                   std::find(currentBots.begin(), currentBots.end(), charInfo.guid) == currentBots.end() &&
+                   (!sPlayerbotAIConfig.disableDeathKnightLogin || charInfo.rClass != CLASS_DEATH_KNIGHT);
+        };
 
-            if (tryLoginBot(charInfo))
+        auto coverageScore = [&](CharacterInfo const& charInfo, TeamId team)
+        {
+            uint32 score = 0;
+            for (size_t band = 0; band < levelBands.size(); ++band)
             {
-                maxAllowedBotCount--;
-                allowedAllianceCount--;
+                if (!bandCoverage[team][band] && charInfo.level >= levelBands[band].minLevel &&
+                    charInfo.level <= levelBands[band].maxLevel)
+                {
+                    score++;
+                }
             }
-        }
+            return score;
+        };
+
+        auto selectBots = [&](std::vector<CharacterInfo> const& candidates, TeamId team, uint32 requested)
+        {
+            uint32 selected = 0;
+            while (selected < requested)
+            {
+                CharacterInfo const* best = nullptr;
+                uint32 bestScore = 0;
+
+                for (CharacterInfo const& candidate : candidates)
+                {
+                    if (!isAvailable(candidate))
+                        continue;
+
+                    uint32 score = coverageScore(candidate, team);
+                    if (!best || score > bestScore)
+                    {
+                        best = &candidate;
+                        bestScore = score;
+                    }
+                }
+
+                if (!best || !tryLoginBot(*best))
+                    break;
+
+                addLevelCoverage(team, best->level);
+                selected++;
+                LOG_DEBUG("playerbots", "Selected level {} {} bot for LFG coverage (score {}, fallback: {})",
+                          best->level, team == TEAM_ALLIANCE ? "Alliance" : "Horde", bestScore,
+                          bestScore ? "no" : "yes");
+            }
+            return selected;
+        };
+
+        // PHASE 1: Log-in Alliance bots up to allowedAllianceCount
+        uint32 allianceSelected = selectBots(allianceChars, TEAM_ALLIANCE, allowedAllianceCount);
+        maxAllowedBotCount -= allianceSelected;
 
         // PHASE 2: Log-in Horde bots up to maxAllowedBotCount
-        for (auto const& charInfo : hordeChars)
-        {
-            if (!maxAllowedBotCount)
-                break;
-
-            if (tryLoginBot(charInfo))
-                maxAllowedBotCount--;
-        }
+        uint32 hordeSelected = selectBots(hordeChars, TEAM_HORDE, maxAllowedBotCount);
+        maxAllowedBotCount -= hordeSelected;
 
         // PHASE 3: If maxAllowedBotCount wasn't reached, log-in more Alliance bots
-        for (auto const& charInfo : allianceChars)
-        {
-            if (!maxAllowedBotCount)
-                break;
-
-            if (tryLoginBot(charInfo))
-                maxAllowedBotCount--;
-        }
+        allianceSelected = selectBots(allianceChars, TEAM_ALLIANCE, maxAllowedBotCount);
+        maxAllowedBotCount -= allianceSelected;
 
         // PHASE 4: An error is given if maxAllowedBotCount is still not reached
         if (maxAllowedBotCount)
@@ -1843,6 +1953,15 @@ void RandomPlayerbotMgr::Randomize(Player* bot)
     if (bot->InBattleground())
         return;
 
+    if (IsPopulationBot(bot) && IsPopulationInitialized(bot))
+    {
+        LOG_DEBUG("playerbots", "Population bot {} is already initialized; preserving level {}",
+                  bot->GetName(), bot->GetLevel());
+        PlayerbotFactory factory(bot, bot->GetLevel());
+        factory.Randomize(true);
+        return;
+    }
+
     if (bot->GetLevel() < 3 || (bot->GetLevel() < 56 && bot->getClass() == CLASS_DEATH_KNIGHT))
     {
         RandomizeFirst(bot);
@@ -1888,6 +2007,13 @@ void RandomPlayerbotMgr::RandomizeFirst(Player* bot)
     PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
     if (!botAI)
         return;
+
+    if (IsPopulationBot(bot) && IsPopulationInitialized(bot))
+    {
+        LOG_DEBUG("playerbots", "Prevented first initialization from running again for population bot {} at level {}",
+                  bot->GetName(), bot->GetLevel());
+        return;
+    }
 
     uint32 maxLevel = sPlayerbotAIConfig.randomBotMaxLevel;
     if (maxLevel > sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL))
@@ -1976,6 +2102,41 @@ void RandomPlayerbotMgr::RandomizeFirst(Player* bot)
         pmo->finish();
 
     RandomTeleportForLevel(bot);
+
+    if (IsPopulationBot(bot))
+    {
+        MarkPopulationInitialized(bot);
+        LOG_DEBUG("playerbots", "Population bot {} completed first initialization at level {}; persistent mark saved",
+                  bot->GetName(), bot->GetLevel());
+    }
+}
+
+bool RandomPlayerbotMgr::IsPopulationBot(Player* bot)
+{
+    uint32 accountId = sCharacterCache->GetCharacterAccountIdByGuid(bot->GetGUID());
+    return accountId && IsAccountType(accountId, 1);
+}
+
+bool RandomPlayerbotMgr::IsPopulationInitialized(Player* bot)
+{
+    uint32 botId = bot->GetGUID().GetCounter();
+    if (GetValue(botId, "population_initialized"))
+        return true;
+
+    bool establishedLevel = bot->getClass() == CLASS_DEATH_KNIGHT ? bot->GetLevel() >= 56 : bot->GetLevel() >= 3;
+    bool initializedByFactory = GetValue(botId, "specNo") || GetValue(botId, "specLink");
+    if (!establishedLevel && !initializedByFactory)
+        return false;
+
+    MarkPopulationInitialized(bot);
+    LOG_DEBUG("playerbots", "Migrated established population bot {} at level {} to persistent initialization mark",
+              bot->GetName(), bot->GetLevel());
+    return true;
+}
+
+void RandomPlayerbotMgr::MarkPopulationInitialized(Player* bot)
+{
+    SetEventValue(bot->GetGUID().GetCounter(), "population_initialized", 1, 0);
 }
 
 void RandomPlayerbotMgr::RandomizeMin(Player* bot)
@@ -2259,7 +2420,8 @@ CachedEvent* RandomPlayerbotMgr::FindEvent(uint32 bot, std::string const& event)
     CachedEvent& e = it->second;
 
     // remove expired events
-    if (e.validIn && (NowSeconds() - e.lastChangeTime) >= e.validIn && event != "specNo" && event != "specLink")
+    if (e.validIn && (NowSeconds() - e.lastChangeTime) >= e.validIn && event != "specNo" && event != "specLink" &&
+        event != "population_initialized")
     {
         cache.events.erase(it);
         return nullptr;
@@ -2533,6 +2695,9 @@ void RandomPlayerbotMgr::OnPlayerLogout(Player* player)
 
 void RandomPlayerbotMgr::OnBotLoginInternal(Player* const bot)
 {
+    if (IsPopulationBot(bot))
+        IsPopulationInitialized(bot);
+
     if (_isBotLogging)
     {
         LOG_INFO("playerbots", "{}/{} Bot {} logged in", playerBots.size(),
