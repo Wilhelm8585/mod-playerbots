@@ -60,6 +60,33 @@ struct GuidClassRaceInfo
     uint32 rRace;
 };
 
+namespace
+{
+struct PopulationLevelBucket
+{
+    uint8 minLevel;
+    uint8 maxLevel;
+    uint8 weight;
+};
+
+constexpr std::array<PopulationLevelBucket, 12> PopulationLevelBuckets = {{
+    {1, 4, 4},
+    {5, 9, 4},
+    {10, 14, 4},
+    {15, 24, 6},
+    {25, 34, 5},
+    {35, 44, 5},
+    {45, 54, 5},
+    {55, 60, 4},
+    {61, 69, 4},
+    {70, 77, 4},
+    {78, 79, 2},
+    {80, 80, 3},
+}};
+
+uint8 PopulationFactionIndex(TeamId team) { return team == TEAM_ALLIANCE ? 0 : 1; }
+}
+
 void PrintStatsThread() { sRandomPlayerbotMgr.PrintStats(); }
 
 void activatePrintStatsThread()
@@ -2064,11 +2091,32 @@ void RandomPlayerbotMgr::RandomizeFirst(Player* bot)
         }
     }
 
+    bool populationPolicyApplied = false;
+    if (IsPopulationBot(bot) && !sPlayerbotAIConfig.disableRandomLevels)
+    {
+        populationPolicyApplied = SelectPopulationInitialLevel(bot, minLevel, maxLevel, level);
+        if (!populationPolicyApplied)
+        {
+            LOG_DEBUG("playerbots",
+                      "Population initial level fallback for {} (faction {}, class {}): no compatible bucket deficit; "
+                      "using legacy level {}",
+                      bot->GetName(), bot->GetTeamId() == TEAM_ALLIANCE ? "Alliance" : "Horde", bot->getClass(), level);
+        }
+    }
+
     if (sPlayerbotAIConfig.disableRandomLevels)
     {
         level = bot->getClass() == CLASS_DEATH_KNIGHT ? std::max(sPlayerbotAIConfig.randombotStartingLevel,
                                                                  sWorld->getIntConfig(CONFIG_START_HEROIC_PLAYER_LEVEL))
                                                       : sPlayerbotAIConfig.randombotStartingLevel;
+
+        if (IsPopulationBot(bot))
+        {
+            LOG_DEBUG("playerbots",
+                      "Population initial level policy bypassed for {} (faction {}, class {}): random levels disabled; "
+                      "using configured level {}",
+                      bot->GetName(), bot->GetTeamId() == TEAM_ALLIANCE ? "Alliance" : "Horde", bot->getClass(), level);
+        }
     }
 
     SetValue(bot, "level", level);
@@ -2109,6 +2157,206 @@ void RandomPlayerbotMgr::RandomizeFirst(Player* bot)
         LOG_DEBUG("playerbots", "Population bot {} completed first initialization at level {}; persistent mark saved",
                   bot->GetName(), bot->GetLevel());
     }
+}
+
+bool RandomPlayerbotMgr::SelectPopulationInitialLevel(Player* bot, uint32 minLevel, uint32 maxLevel, uint32& level)
+{
+    uint32 classMinLevel = minLevel;
+    if (bot->getClass() == CLASS_DEATH_KNIGHT)
+        classMinLevel = std::max(classMinLevel, static_cast<uint32>(sWorld->getIntConfig(CONFIG_START_HEROIC_PLAYER_LEVEL)));
+
+    if (classMinLevel > maxLevel)
+        return false;
+
+    std::array<bool, PopulationLevelBuckets.size()> policyCompatible = {};
+    std::array<bool, PopulationLevelBuckets.size()> classCompatible = {};
+    uint32 compatibleWeight = 0;
+    for (size_t bucket = 0; bucket < PopulationLevelBuckets.size(); ++bucket)
+    {
+        PopulationLevelBucket const& range = PopulationLevelBuckets[bucket];
+        policyCompatible[bucket] = std::max<uint32>(range.minLevel, minLevel) <=
+                                   std::min<uint32>(range.maxLevel, maxLevel);
+        classCompatible[bucket] = policyCompatible[bucket] &&
+                                  std::max<uint32>(range.minLevel, classMinLevel) <=
+                                      std::min<uint32>(range.maxLevel, maxLevel);
+        if (policyCompatible[bucket])
+            compatibleWeight += range.weight;
+    }
+
+    if (!compatibleWeight)
+        return false;
+
+    std::array<std::array<uint32, 2>, PopulationLevelBuckets.size()> current = {};
+    std::array<uint32, 2> currentFaction = {};
+    uint32 establishedCount = 0;
+    std::unordered_set<uint32> populationAccounts(rndBotTypeAccounts.begin(), rndBotTypeAccounts.end());
+
+    PlayerbotsDatabasePreparedStatement* stmt =
+        PlayerbotsDatabase.GetPreparedStatement(PLAYERBOTS_SEL_RANDOM_BOTS_BY_EVENT_AND_VALUE);
+    stmt->SetData(0, "population_initialized");
+    stmt->SetData(1, 1);
+    PreparedQueryResult result = PlayerbotsDatabase.Query(stmt);
+    if (result)
+    {
+        do
+        {
+            uint32 guid = result->Fetch()[0].Get<uint32>();
+            ObjectGuid playerGuid = ObjectGuid::Create<HighGuid::Player>(guid);
+            uint32 accountId = sCharacterCache->GetCharacterAccountIdByGuid(playerGuid);
+            if (!accountId || populationAccounts.find(accountId) == populationAccounts.end())
+                continue;
+
+            CharacterCacheEntry const* character = sCharacterCache->GetCharacterCacheByGuid(playerGuid);
+            if (!character)
+                continue;
+
+            uint8 faction = PopulationFactionIndex(IsAlliance(character->Race) ? TEAM_ALLIANCE : TEAM_HORDE);
+            establishedCount++;
+            currentFaction[faction]++;
+
+            for (size_t bucket = 0; bucket < PopulationLevelBuckets.size(); ++bucket)
+            {
+                PopulationLevelBucket const& range = PopulationLevelBuckets[bucket];
+                if (character->Level >= range.minLevel && character->Level <= range.maxLevel)
+                {
+                    current[bucket][faction]++;
+                    break;
+                }
+            }
+        } while (result->NextRow());
+    }
+
+    uint32 targetPopulation = establishedCount + 1;
+    std::array<uint32, PopulationLevelBuckets.size()> bucketTarget = {};
+    std::array<uint32, PopulationLevelBuckets.size()> remainder = {};
+    uint32 assignedTargets = 0;
+    for (size_t bucket = 0; bucket < PopulationLevelBuckets.size(); ++bucket)
+    {
+        if (!policyCompatible[bucket])
+            continue;
+
+        uint32 weightedPopulation = targetPopulation * PopulationLevelBuckets[bucket].weight;
+        bucketTarget[bucket] = weightedPopulation / compatibleWeight;
+        remainder[bucket] = weightedPopulation % compatibleWeight;
+        assignedTargets += bucketTarget[bucket];
+    }
+
+    while (assignedTargets < targetPopulation)
+    {
+        uint32 bestRemainder = 0;
+        std::vector<size_t> tiedBuckets;
+        for (size_t bucket = 0; bucket < PopulationLevelBuckets.size(); ++bucket)
+        {
+            if (!policyCompatible[bucket] || remainder[bucket] < bestRemainder)
+                continue;
+
+            if (remainder[bucket] > bestRemainder)
+            {
+                bestRemainder = remainder[bucket];
+                tiedBuckets.clear();
+            }
+            tiedBuckets.push_back(bucket);
+        }
+
+        if (tiedBuckets.empty())
+            break;
+
+        size_t selected = tiedBuckets[urand(0, static_cast<uint32>(tiedBuckets.size() - 1))];
+        bucketTarget[selected]++;
+        remainder[selected] = 0;
+        assignedTargets++;
+    }
+
+    std::array<uint32, 2> globalFactionTarget = {targetPopulation / 2, targetPopulation / 2};
+    if (targetPopulation % 2)
+    {
+        int32 allianceDeficit = static_cast<int32>(globalFactionTarget[0] + 1) - currentFaction[0];
+        int32 hordeDeficit = static_cast<int32>(globalFactionTarget[1] + 1) - currentFaction[1];
+        uint8 extraFaction = allianceDeficit == hordeDeficit ? urand(0, 1) : (allianceDeficit > hordeDeficit ? 0 : 1);
+        globalFactionTarget[extraFaction]++;
+    }
+
+    std::array<std::array<uint32, 2>, PopulationLevelBuckets.size()> target = {};
+    std::array<uint32, 2> assignedFactionTargets = {};
+    std::vector<size_t> oddBuckets;
+    for (size_t bucket = 0; bucket < PopulationLevelBuckets.size(); ++bucket)
+    {
+        target[bucket][0] = bucketTarget[bucket] / 2;
+        target[bucket][1] = bucketTarget[bucket] / 2;
+        assignedFactionTargets[0] += target[bucket][0];
+        assignedFactionTargets[1] += target[bucket][1];
+        if (bucketTarget[bucket] % 2)
+            oddBuckets.push_back(bucket);
+    }
+
+    std::shuffle(oddBuckets.begin(), oddBuckets.end(), std::mt19937(std::random_device{}()));
+    for (size_t bucket : oddBuckets)
+    {
+        int32 allianceDeficit = static_cast<int32>(globalFactionTarget[0]) - currentFaction[0] -
+                                assignedFactionTargets[0];
+        int32 hordeDeficit = static_cast<int32>(globalFactionTarget[1]) - currentFaction[1] -
+                             assignedFactionTargets[1];
+        uint8 extraFaction = allianceDeficit == hordeDeficit ? urand(0, 1) : (allianceDeficit > hordeDeficit ? 0 : 1);
+        target[bucket][extraFaction]++;
+        assignedFactionTargets[extraFaction]++;
+    }
+
+    uint8 botFaction = PopulationFactionIndex(bot->GetTeamId());
+    std::vector<size_t> emptyBuckets;
+    std::vector<size_t> bestBuckets;
+    uint32 bestDeficit = 0;
+    uint32 bestTarget = 1;
+
+    for (size_t bucket = 0; bucket < PopulationLevelBuckets.size(); ++bucket)
+    {
+        if (!classCompatible[bucket] || !target[bucket][botFaction] ||
+            current[bucket][botFaction] >= target[bucket][botFaction])
+            continue;
+
+        uint32 deficit = target[bucket][botFaction] - current[bucket][botFaction];
+        if (!current[bucket][botFaction])
+        {
+            emptyBuckets.push_back(bucket);
+            continue;
+        }
+
+        uint64 score = static_cast<uint64>(deficit) * bestTarget;
+        uint64 bestScore = static_cast<uint64>(bestDeficit) * target[bucket][botFaction];
+        if (bestBuckets.empty() || score > bestScore)
+        {
+            bestBuckets.clear();
+            bestBuckets.push_back(bucket);
+            bestDeficit = deficit;
+            bestTarget = target[bucket][botFaction];
+        }
+        else if (score == bestScore)
+        {
+            bestBuckets.push_back(bucket);
+        }
+    }
+
+    std::vector<size_t> const& candidates = emptyBuckets.empty() ? bestBuckets : emptyBuckets;
+    if (candidates.empty())
+        return false;
+
+    size_t selectedBucket = candidates[urand(0, static_cast<uint32>(candidates.size() - 1))];
+    PopulationLevelBucket const& selectedRange = PopulationLevelBuckets[selectedBucket];
+    uint32 selectedMinLevel = std::max<uint32>(selectedRange.minLevel, classMinLevel);
+    uint32 selectedMaxLevel = std::min<uint32>(selectedRange.maxLevel, maxLevel);
+
+    if (selectedMinLevel == selectedMaxLevel)
+        level = selectedMinLevel;
+    else if (selectedBucket == 0 && selectedMinLevel == 1 && urand(0, 1) == 0)
+        level = 1;
+    else
+        level = urand(selectedBucket == 0 && selectedMinLevel == 1 ? 2 : selectedMinLevel, selectedMaxLevel);
+
+    uint32 deficit = target[selectedBucket][botFaction] - current[selectedBucket][botFaction];
+    LOG_DEBUG("playerbots",
+              "Population initial level for {} (faction {}, class {}): bucket {}-{}, level {}, deficit {}/target {}",
+              bot->GetName(), bot->GetTeamId() == TEAM_ALLIANCE ? "Alliance" : "Horde", bot->getClass(),
+              selectedRange.minLevel, selectedRange.maxLevel, level, deficit, target[selectedBucket][botFaction]);
+    return true;
 }
 
 bool RandomPlayerbotMgr::IsPopulationBot(Player* bot)

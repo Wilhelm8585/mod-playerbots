@@ -180,6 +180,7 @@ private:
     bool IsPopulationBot(Player* bot);
     bool IsPopulationInitialized(Player* bot);
     void MarkPopulationInitialized(Player* bot);
+    bool SelectPopulationInitialLevel(Player* bot, uint32 minLevel, uint32 maxLevel, uint32& level);
 
     RandomPlayerbotMgr() : PlayerbotHolder(), processTicks(0)
     {
