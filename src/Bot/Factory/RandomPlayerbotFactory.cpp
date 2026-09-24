@@ -312,27 +312,18 @@ std::string const RandomPlayerbotFactory::CreateRandomBotName(NameRaceAndGender 
 // AssignAccountTypes()
 uint32 RandomPlayerbotFactory::CalculateTotalAccountCount()
 {
-    // Reset account types if features are disabled
-    // Reset is done here to precede needed accounts calculations
-    if (sPlayerbotAIConfig.maxRandomBots == 0 || sPlayerbotAIConfig.addClassAccountPoolSize == 0)
+    // Preserve the persistent RNDbot pool when the requested online population is zero.
+    // AddClass keeps its existing disable-and-unassign semantics.
+    if (sPlayerbotAIConfig.addClassAccountPoolSize == 0)
     {
-        if (sPlayerbotAIConfig.maxRandomBots == 0)
-        {
-            PlayerbotsDatabase.Execute("UPDATE playerbots_account_type SET account_type = 0 WHERE account_type = 1");
-            LOG_INFO("playerbots", "MaxRandomBots set to 0, any RNDbot accounts (type 1) will be unassigned (type 0)");
-        }
-        if (sPlayerbotAIConfig.addClassAccountPoolSize == 0)
-        {
-            PlayerbotsDatabase.Execute("UPDATE playerbots_account_type SET account_type = 0 WHERE account_type = 2");
-            LOG_INFO("playerbots", "AddClassAccountPoolSize set to 0, any AddClass accounts (type 2) will be unassigned (type 0)");
-        }
+        PlayerbotsDatabase.Execute("UPDATE playerbots_account_type SET account_type = 0 WHERE account_type = 2");
+        LOG_INFO("playerbots", "AddClassAccountPoolSize set to 0, any AddClass accounts (type 2) will be unassigned (type 0)");
 
         // Wait for DB to reflect the change, up to 1 second max. This is needed to make sure other logs don't show wrong info
         for (int waited = 0; waited < 1000; waited += 50)
         {
-            QueryResult res = PlayerbotsDatabase.Query("SELECT COUNT(*) FROM playerbots_account_type WHERE account_type IN ({}, {})",
-                sPlayerbotAIConfig.maxRandomBots == 0 ? 1 : -1,
-                sPlayerbotAIConfig.addClassAccountPoolSize == 0 ? 2 : -1);
+            QueryResult res = PlayerbotsDatabase.Query(
+                "SELECT COUNT(*) FROM playerbots_account_type WHERE account_type = 2");
 
             if (!res || res->Fetch()[0].Get<uint64>() == 0)
                 break;
